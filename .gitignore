@@ -17,6 +17,10 @@ build/
 
 sites/
 data/logs/
+temp/
+data/raw/azmet/
+data/raw/hrrr/
+
 
 # Local files
 .DS_Store

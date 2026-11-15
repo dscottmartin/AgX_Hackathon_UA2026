@@ -2,6 +2,8 @@
 neonutilities
 python-dotenv
 python-CIMIS
+requests
+herbie-data
 
 # Data processing
 numpy
@@ -19,3 +21,7 @@ altair
 
 # Testing
 pytest
+
+xarray 
+cfgrib 
+eccodes

@@ -46,6 +46,7 @@ def download_product(
         package="basic",
         timeindex="30",
         check_size=False,
+        include_provisional=True,
         token=token,
     )
 
@@ -85,6 +86,7 @@ def main() -> None:
             "NEON_TOKEN not found. Add it to the .env file."
         )
 
+    failed = []
     for name, product_id in PRODUCTS.items():
         try:
             download_product(
@@ -96,8 +98,11 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"Failed to download {name}: {exc}")
+            failed.append(name)
 
     print("\nDownload process finished.")
+    if failed:
+        raise SystemExit(f"Failed products: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

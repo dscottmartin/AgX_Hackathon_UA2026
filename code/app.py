@@ -15,15 +15,15 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
+from estimate import apply_confidence, interpolate, pick_masts
 from rules import CAUTION, GO, NO_DATA, STOP, TZ, Config, evaluate_series, load_processed
 
 ROOT = Path(__file__).resolve().parents[1]
 NEON_TWO = ROOT / "data/processed/soap_2025-06_two_level.csv"
 NEON_PROFILE = ROOT / "data/processed/soap_2025-06_temp_profile.csv"
 NEON_POS = ROOT / "data/raw/neon/SOAP/2025-06/temperature/sensor_positions_00002.csv"
+MAST_DIR = ROOT / "data/processed/masts"   # from code/simulate_masts.py
 
-DEMO_DATE = pd.Timestamp("2025-06-15").date()
-NEON_FIRST, NEON_LAST = pd.Timestamp("2025-06-01").date(), pd.Timestamp("2025-06-29").date()
 STEPS = 48         # 30-min readings from noon to noon
 DEFAULT_IDX = 15   # 19:30
 
@@ -36,7 +36,31 @@ ACTION = {
     NO_DATA: "Readings are missing. Check conditions on site.",
 }
 NEON_LABELS = dict(low_label="5 m (17 ft)", high_label="12 m (39 ft)")
+MAST_LABELS = dict(low_label="5 ft (1.5 m)", high_label="30 ft (9.1 m)")
 SIM_LABELS = dict(low_label="1.5 m (5 ft)", high_label="9 m (30 ft)")
+
+
+def load_mast_sites() -> pd.DataFrame:
+    path = MAST_DIR / "sites.csv"
+    return pd.read_csv(path) if path.exists() else pd.DataFrame(columns=["site_id", "name", "lat", "lon"])
+
+
+MAST_SITES = load_mast_sites()
+
+# Recorded data sets the app replays night by night. Any file with the rules.py columns works.
+# Data sets in the same group share one date and one time slider, so their map pins line up.
+REPLAYS = {
+    "neon": dict(path=NEON_TWO, profile=NEON_PROFILE, labels=NEON_LABELS, group="neon",
+                 source="Real NEON tower data (replay)", default="2025-06-15",
+                 first="2025-06-01", last="2025-06-29"),
+    **{f"mast:{s.site_id}": dict(path=MAST_DIR / f"{s.site_id}.csv", profile=None, labels=MAST_LABELS,
+                                 group="mast", default="2026-06-02",
+                                 source=f"Our 5 ft / 30 ft mast at {s['name']} (simulated readings)")
+       for _, s in MAST_SITES.iterrows()},
+}
+GROUP_FIRST = {}  # first data set in each group, used for its date range
+for _ds, _r in REPLAYS.items():
+    GROUP_FIRST.setdefault(_r["group"], _ds)
 
 SCENARIOS = {
     "Evening inversion, breezy ground": dict(inv=0.9, day_wind=5.5, night_wind=4.0),
@@ -75,14 +99,49 @@ CSS = """
 # ---------- Data ----------
 
 @st.cache_data
-def neon_log(volatility: str) -> pd.DataFrame:
-    return evaluate_series(load_processed(NEON_TWO), Config.for_volatility(volatility, **NEON_LABELS))
+def replay_log(ds: str, volatility: str) -> pd.DataFrame:
+    r = REPLAYS[ds]
+    return evaluate_series(load_processed(r["path"]), Config.for_volatility(volatility, **r["labels"]))
 
 
 @st.cache_data
-def neon_profile() -> pd.DataFrame:
-    df = load_processed(NEON_PROFILE)
+def replay_profile(ds: str) -> pd.DataFrame | None:
+    path = REPLAYS[ds]["profile"]
+    if path is None:
+        return None
+    df = load_processed(path)
     return df.rename(columns={c: float(c[2:-1]) for c in df.columns})  # "T_0.33m" -> 0.33
+
+
+@st.cache_data
+def replay_dates(ds: str):
+    """First, last and default night for a replay (read from the file when not set)."""
+    r = REPLAYS[ds]
+    if "first" in r:
+        first, last = pd.Timestamp(r["first"]).date(), pd.Timestamp(r["last"]).date()
+    else:
+        nights = (load_processed(r["path"]).index - pd.Timedelta(hours=12)).date
+        first, last = min(nights), max(nights)
+    default = min(max(pd.Timestamp(r["default"]).date(), first), last)
+    return first, last, default
+
+
+@st.cache_data
+def mast_readings() -> dict[str, pd.DataFrame]:
+    return {s: load_processed(MAST_DIR / f"{s}.csv") for s in MAST_SITES.site_id}
+
+
+@st.cache_data
+def est_log(lat: float, lon: float, terrain: str, volatility: str):
+    """Readings and statuses for an orchard without a mast, estimated from nearby masts."""
+    used, same_terrain = pick_masts(lat, lon, terrain, MAST_SITES)
+    cfg = Config.for_volatility(volatility, **MAST_LABELS)
+    log = evaluate_series(interpolate(mast_readings(), used), cfg)
+    mast_logs = {sid: replay_log(f"mast:{sid}", volatility) for sid in used.site_id}
+    log = apply_confidence(log, mast_logs, used, same_terrain)
+    based_on = ", ".join(f"{n} ({km:.0f} km)" for n, km in zip(used.name, used.km))
+    note = "" if same_terrain else ", different terrain"
+    return log, f"Estimated from nearby masts{note}: {based_on}"
 
 
 @st.cache_data
@@ -132,16 +191,25 @@ def noon_window(df: pd.DataFrame, date) -> pd.DataFrame:
 
 def orchard_view(o: dict, volatility: str) -> dict:
     """Everything the page needs for one orchard: its log window, profile, and labels."""
-    if o["source"] == "neon":
-        date = st.session_state.neon_date
-        full = neon_log(volatility)
-        view = dict(win=noon_window(full, date), profile=noon_window(neon_profile(), date), full=full,
-                    labels=NEON_LABELS, source="Real NEON tower data (replay)", key=f"t_{o['id']}_{date}")
+    if o["source"] == "replay":
+        ds = o["dataset"]
+        group = REPLAYS[ds]["group"]
+        date = st.session_state.replay_date[group]
+        full, prof = replay_log(ds, volatility), replay_profile(ds)
+        view = dict(win=noon_window(full, date), full=full, labels=REPLAYS[ds]["labels"],
+                    profile=None if prof is None else noon_window(prof, date), group=group,
+                    source=REPLAYS[ds]["source"], key=f"t_{group}_{date}")
+    elif o["source"] == "est":
+        date = st.session_state.replay_date["mast"]
+        full, source = est_log(o["lat"], o["lon"], o["terrain"], volatility)
+        view = dict(win=noon_window(full, date), full=full, labels=MAST_LABELS, profile=None,
+                    group="mast", source=source, key=f"t_mast_{date}")
     else:
         date = pd.Timestamp.now(tz=TZ).date()
         win = sim_log(o["scenario"], o["seed"], date, volatility)
         view = dict(win=win, profile=None, full=win, labels=SIM_LABELS,
-                    source=f"Simulated sensors: {o['scenario'].lower()}", key=f"t_{o['id']}_{date}")
+                    source=f"Simulated sensors: {o['scenario'].lower()}", key=f"t_{o['id']}_{date}",
+                    group=None)
     n = len(view["win"])
     if n:
         st.session_state.pos.setdefault(view["key"], min(DEFAULT_IDX, n - 1))
@@ -153,14 +221,18 @@ def init_state():
         return
     lat, lon = neon_location()
     st.session_state.orchards = [
-        dict(id="neon-soap", name="NEON SOAP tower", lat=lat, lon=lon, source="neon"),
+        dict(id="neon-soap", name="NEON SOAP tower", lat=lat, lon=lon, source="replay", dataset="neon"),
+        *[dict(id=f"mast-{s.site_id}", name=f"Mast: {s['name']}", lat=float(s.lat), lon=float(s.lon),
+               source="replay", dataset=f"mast:{s.site_id}") for _, s in MAST_SITES.iterrows()],
+        *([dict(id="est-dinuba", name="Dinuba peach block (no mast, estimated)", lat=36.543,
+                lon=-119.387, source="est", terrain="floor")] if len(MAST_SITES) else []),
         dict(id="sim-parlier", name="Parlier almond block", lat=36.611, lon=-119.527, source="sim",
              scenario="Evening inversion, breezy ground", seed=1),
         dict(id="sim-kerman", name="Kerman pistachio block", lat=36.723, lon=-120.060, source="sim",
              scenario="Wind shift above the trees", seed=2),
     ]
     st.session_state.selected_id = "neon-soap"
-    st.session_state.neon_date = DEMO_DATE
+    st.session_state.replay_date = {g: replay_dates(ds)[2] for g, ds in GROUP_FIRST.items()}
     st.session_state.playing = False
     st.session_state.pos = {}  # selected time index per orchard window (survives widget cleanup)
     st.session_state.new_lat, st.session_state.new_lon = 36.75, -119.80
@@ -200,12 +272,13 @@ def status_now(view: dict) -> str:
     return view["win"].status.iloc[st.session_state.pos[view["key"]]]
 
 
-def sync(src: str, dst: str | None = None, pos_key: str | None = None):
-    """Copy a widget value into state that persists when the widget is not drawn."""
-    if pos_key is not None:
-        st.session_state.pos[pos_key] = st.session_state[src]
-    else:
-        st.session_state[dst] = st.session_state[src]
+def sync(src: str, pos_key: str):
+    """Copy the time slider into state that persists when the widget is not drawn."""
+    st.session_state.pos[pos_key] = st.session_state[src]
+
+
+def sync_date(src: str, group: str):
+    st.session_state.replay_date[group] = st.session_state[src]
 
 
 st.markdown(
@@ -219,13 +292,17 @@ left, right = st.columns([5, 7], gap="large")
 with left:
     fmap = folium.Map(location=[36.8, -119.7], zoom_start=8, tiles="OpenStreetMap")
     for o in orchards:
-        is_sel = o["id"] == sel_id
+        is_sel, is_est = o["id"] == sel_id, o["source"] == "est"
         folium.CircleMarker(
             [o["lat"], o["lon"]], radius=12 if is_sel else 8,
-            color="#1D2621" if is_sel else "#FFFFFF", weight=3 if is_sel else 1.5,
-            fill=True, fill_color=COLORS[status_now(views[o["id"]])], fill_opacity=0.95,
+            color="#1D2621" if is_sel or is_est else "#FFFFFF", weight=3 if is_sel or is_est else 1.5,
+            dash_array="3 3" if is_est else None,
+            fill=True, fill_color=COLORS[status_now(views[o["id"]])], fill_opacity=0.45 if is_est else 0.95,
             tooltip=o["name"],
         ).add_to(fmap)
+    fmap.fit_bounds([[min(o["lat"] for o in orchards), min(o["lon"] for o in orchards)],
+                     [max(o["lat"] for o in orchards), max(o["lon"] for o in orchards)]],
+                    padding=(20, 20))
     out = st_folium(fmap, height=440, use_container_width=True, key="map",
                     returned_objects=["last_object_clicked_tooltip", "last_clicked"])
 
@@ -244,14 +321,25 @@ with left:
             st.session_state.new_lon = round(clicked["lng"], 5)
 
     st.selectbox("Orchard", list(names), format_func=names.get, key="selected_id")
-    st.caption("Pin color shows each orchard's status at its selected time. Click a pin to open it, "
+    if v["group"] == "mast" and len(v["win"]):
+        group_status = pd.Series([status_now(views[o["id"]]) for o in orchards
+                                  if o["source"] == "replay" and views[o["id"]]["group"] == "mast"]
+                                 ).value_counts()
+        at = v["win"].index[st.session_state.pos[v["key"]]]
+        st.markdown(f"**All {group_status.sum()} masts at {at:%a %H:%M}:** "
+                    + ", ".join(f"{group_status[s]} {s}" for s in COLORS if s in group_status))
+    st.caption("Pin color shows each orchard's status at its selected time. Faded pins with a dashed "
+               "edge have no mast and are estimated from nearby masts. Click a pin to open it, "
                "or click an empty spot to copy its coordinates into Add an orchard.")
 
 with right:
-    if sel["source"] == "neon":
-        st.session_state["_neon_date"] = st.session_state.neon_date
-        st.date_input("Night of", key="_neon_date", min_value=NEON_FIRST, max_value=NEON_LAST,
-                      on_change=sync, args=("_neon_date", "neon_date"),
+    if v["group"]:
+        group = v["group"]
+        first, last, _ = replay_dates(GROUP_FIRST[group])
+        dkey = f"_date_{group}"
+        st.session_state[dkey] = st.session_state.replay_date[group]
+        st.date_input("Night of", key=dkey, min_value=first, max_value=last,
+                      on_change=sync_date, args=(dkey, group),
                       help="Each window runs from noon to noon the next day.")
     win = v["win"]
     if win.empty:
@@ -269,7 +357,7 @@ with right:
     wkey = "w_" + v["key"]
     st.session_state[wkey] = st.session_state.pos[v["key"]]
     idx = st.select_slider("Time", options=list(range(len(win))), format_func=lambda i: labels[i],
-                           key=wkey, on_change=sync, args=(wkey,), kwargs={"pos_key": v["key"]})
+                           key=wkey, on_change=sync, args=(wkey, v["key"]))
     row, ts = win.iloc[idx], win.index[idx]
     status, single = row.status, row.single_station_status
 
@@ -384,7 +472,8 @@ with c_prof:
 # ---------- Log ----------
 
 st.markdown("#### Log")
-log_cols = ["status", "single_station_status", "triggers", "dT_C", "ws_low_mph", "ws_high_mph", "reasons"]
+log_cols = ["status", "single_station_status", "triggers", "T_low_C", "T_high_C", "dT_C",
+            "ws_low_mph", "ws_high_mph", "wd_low_deg", "wd_high_deg", "reasons"]
 log_view = win[log_cols].copy()
 log_view.index = log_view.index.strftime("%a %b %d %H:%M")
 st.dataframe(log_view.round(2), width="stretch", height=300)
@@ -403,7 +492,12 @@ with st.sidebar:
         name = st.text_input("Name", placeholder="North almond block")
         lat = st.number_input("Latitude", key="new_lat", min_value=-90.0, max_value=90.0, format="%.5f")
         lon = st.number_input("Longitude", key="new_lon", min_value=-180.0, max_value=180.0, format="%.5f")
-        scenario = st.selectbox("Simulated conditions", list(SCENARIOS))
+        modes = (["Estimate from nearby masts"] if len(MAST_SITES) else []) + ["Simulated scenario"]
+        mode = st.radio("Readings", modes)
+        terrain = st.selectbox("Terrain (for estimates)", ["floor", "foothill", "west"],
+                               format_func={"floor": "Valley floor", "foothill": "Foothill edge",
+                                            "west": "West side"}.get)
+        scenario = st.selectbox("Scenario (for simulation)", list(SCENARIOS))
         submitted = st.form_submit_button("Add orchard", width="stretch")
     if submitted:
         name = name.strip()
@@ -413,11 +507,15 @@ with st.sidebar:
             st.error("An orchard with that name already exists. Pick another name.")
         else:
             new_id = f"user-{len(orchards)}"
-            orchards.append(dict(id=new_id, name=name, lat=lat, lon=lon, source="sim",
-                                 scenario=scenario, seed=len(orchards) + 10))
+            if mode.startswith("Estimate"):
+                orchards.append(dict(id=new_id, name=name, lat=lat, lon=lon, source="est", terrain=terrain))
+            else:
+                orchards.append(dict(id=new_id, name=name, lat=lat, lon=lon, source="sim",
+                                     scenario=scenario, seed=len(orchards) + 10))
             st.session_state.pending_select = new_id
             st.rerun()
-    st.caption("New orchards use simulated two-height sensors until real sensors are connected.")
+    st.caption("Orchards without a mast are estimated from the nearest masts with the same terrain. "
+               "The estimate never says GO when a nearby mast does not.")
 
 if st.session_state.playing:
     time.sleep(0.5)

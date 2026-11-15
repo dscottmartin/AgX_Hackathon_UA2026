@@ -1,4 +1,4 @@
-"""Build clean analysis tables from raw NEON SOAP data.
+"""Build clean analysis tables from raw NEON tower data.
 
 Outputs (data/processed/):
   <site>_<month>_two_level.csv    lower/upper temperature and wind, one row per 30 min
@@ -7,23 +7,24 @@ Outputs (data/processed/):
 Flagged readings are set to NaN (not dropped), and the time axis is filled to a
 full 30-min grid, so missing data stays visible and the rules engine can report it.
 """
+import argparse
 from pathlib import Path
 
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-SITE, MONTH = "SOAP", "2025-06"
-RAW = ROOT / "data/raw/neon" / SITE / MONTH
+RAW_ROOT = ROOT / "data/raw/neon"
 OUT = ROOT / "data/processed"
 TZ = "America/Los_Angeles"
 
-LOW, HIGH = 20, 30  # NEON verticalPosition codes: 5.22 m and 11.93 m at SOAP
+LOW, HIGH = 20, 30  # SJER: about 1.5 m and 5.5 m; check metadata for each site
 MS_TO_MPH = 2.236936
 
 
-def read_levels(path, value_col, qf_col):
+def read_levels(paths, value_col, qf_col):
     """Return a wide table (time x level). Values with a nonzero quality flag become NaN."""
-    df = pd.read_csv(path, parse_dates=["startDateTime"])
+    df = pd.concat((pd.read_csv(path, parse_dates=["startDateTime"]) for path in paths),
+                   ignore_index=True)
     df[value_col] = df[value_col].where(df[qf_col] == 0)
     wide = df.pivot(index="startDateTime", columns="verticalPosition", values=value_col)
     wide.index = wide.index.tz_convert(TZ)
@@ -38,13 +39,24 @@ def level_heights(path):
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    heights = level_heights(RAW / "temperature/sensor_positions_00002.csv")
+    parser = argparse.ArgumentParser(description="Prepare NEON tower data")
+    parser.add_argument("--site", default="SJER")
+    parser.add_argument("--months", nargs="+", default=["2026-08", "2026-09", "2026-10"])
+    args = parser.parse_args()
+    months = sorted(set(args.months))
+    raw_dirs = [RAW_ROOT / args.site / month for month in months]
+    for raw in raw_dirs:
+        if not (raw / "temperature/SAAT_30min.csv").is_file() or not (raw / "wind/2DWSD_30min.csv").is_file():
+            parser.error(f"Missing temperature or wind data in {raw}")
 
-    T = read_levels(RAW / "temperature/SAAT_30min.csv", "tempSingleMean", "finalQF")
-    wind_path = RAW / "wind/2DWSD_30min.csv"
-    WS = read_levels(wind_path, "windSpeedMean", "windSpeedFinalQF") * MS_TO_MPH
-    WD = read_levels(wind_path, "windDirMean", "windDirFinalQF")
+    OUT.mkdir(parents=True, exist_ok=True)
+    heights = level_heights(raw_dirs[-1] / "temperature/sensor_positions_00002.csv")
+
+    T = read_levels([raw / "temperature/SAAT_30min.csv" for raw in raw_dirs],
+                    "tempSingleMean", "finalQF")
+    wind_paths = [raw / "wind/2DWSD_30min.csv" for raw in raw_dirs]
+    WS = read_levels(wind_paths, "windSpeedMean", "windSpeedFinalQF") * MS_TO_MPH
+    WD = read_levels(wind_paths, "windDirMean", "windDirFinalQF")
 
     # Full 30-min grid so gaps stay visible as NaN rows
     start = min(T.index.min(), WS.index.min())
@@ -65,7 +77,8 @@ def main():
     profile.columns = [f"T_{heights[c]:.2f}m" for c in profile.columns]
     profile.index.name = "timestamp_local"
 
-    prefix = f"{SITE.lower()}_{MONTH}"
+    period = months[0] if len(months) == 1 else f"{months[0]}_{months[-1]}"
+    prefix = f"{args.site.lower()}_{period}"
     two_path = OUT / f"{prefix}_two_level.csv"
     profile_path = OUT / f"{prefix}_temp_profile.csv"
     two.round(3).to_csv(two_path)
