@@ -14,7 +14,9 @@ venv/
 build/
 *.egg-info/
 
+
 sites/
+data/logs/
 
 # Local files
 .DS_Store
