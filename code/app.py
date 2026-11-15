@@ -12,10 +12,12 @@ import altair as alt
 import folium
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
 from estimate import apply_confidence, interpolate, pick_masts
+from notifications import send_ntfy_alert
 from rules import CAUTION, GO, NO_DATA, STOP, TZ, Config, evaluate_series, load_processed
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -250,6 +252,11 @@ with st.sidebar:
     volatility = st.radio(
         "Product volatility", ["low", "medium", "high"], index=1, format_func=str.capitalize,
         help="Volatile products can keep drifting as vapor, so any real inversion becomes a STOP.")
+    st.markdown("### Push notifications")
+    ntfy_topic = st.text_input("ntfy.sh topic", help="Subscribe to this topic in the ntfy app.").strip()
+    auto_alerts = st.toggle("Alert while replaying", value=False,
+                            help="Opt in to one alert per STOP or CAUTION status while playing a historical or simulated night.")
+    st.caption("Alerts describe the selected replay or simulation, not current field conditions.")
 
 orchards = st.session_state.orchards
 names = {o["id"]: o["name"] for o in orchards}
@@ -367,6 +374,24 @@ with right:
         f'<div class="sw-action">{ACTION[status]}</div>'
         f'<div class="sw-when">{ts:%A %b %d, %H:%M}<br>{v["source"]}</div></div>',
         unsafe_allow_html=True)
+
+    if "sent_alerts" not in st.session_state:
+        st.session_state.sent_alerts = set()
+    alert_key = (ntfy_topic, sel["id"], str(ts.date()), status)
+    manual_alert = st.button("Send push for this reading", disabled=not ntfy_topic,
+                             help="Sends the selected historical or simulated reading to your ntfy topic.")
+    should_auto_alert = (auto_alerts and st.session_state.playing and ntfy_topic
+                         and status in (STOP, CAUTION) and alert_key not in st.session_state.sent_alerts)
+    if manual_alert or should_auto_alert:
+        try:
+            send_ntfy_alert(ntfy_topic, status, sel["name"], ts, row.reasons,
+                            f"Demo replay (not live): {v['source']}")
+        except (ValueError, requests.RequestException) as exc:
+            st.error(f"Push notification failed: {exc}")
+        else:
+            if should_auto_alert:
+                st.session_state.sent_alerts.add(alert_key)
+            st.toast(f"Push sent for {status}.")
 
     def mini(label, s):
         return (f'<div class="sw-mini" style="background:{COLORS[s]};color:{TEXT_ON[s]}">'
