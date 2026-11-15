@@ -1,0 +1,21 @@
+# data download
+neonutilities
+python-dotenv
+python-CIMIS
+
+# Data processing
+numpy
+pandas
+
+# Visualization
+matplotlib
+plotly
+
+# Dashboard
+streamlit>=1.50
+streamlit-folium
+folium
+altair
+
+# Testing
+pytest
