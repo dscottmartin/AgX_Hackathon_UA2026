@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+import requests
 
 import altair as alt
 import folium
@@ -101,7 +102,7 @@ def simulate(scenario: str, seed: int, date) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     start = pd.Timestamp(date).tz_localize(TZ) + pd.Timedelta(hours=12)
     idx = pd.date_range(start, periods=STEPS, freq="30min", name="timestamp_local")
-    t = np.arange(STEPS) / 2                                   # hours since noon
+    t = np.arange(STEPS) / 2                                 # hours since noon
     night = np.clip(np.sin(np.pi * (t - 7) / 14), 0, None)     # 0 at 19:00 and 09:00, peaks ~02:00
     T_low = 20 + 8 * np.cos(2 * np.pi * (t - 3) / 24) + rng.normal(0, 0.05, STEPS)
     dT = -0.4 * (1 - night) + p["inv"] * night + rng.normal(0, 0.03, STEPS)
@@ -132,20 +133,66 @@ def noon_window(df: pd.DataFrame, date) -> pd.DataFrame:
 
 def orchard_view(o: dict, volatility: str) -> dict:
     """Everything the page needs for one orchard: its log window, profile, and labels."""
-    if o["source"] == "neon":
-        date = st.session_state.neon_date
-        full = neon_log(volatility)
-        view = dict(win=noon_window(full, date), profile=noon_window(neon_profile(), date), full=full,
-                    labels=NEON_LABELS, source="Real NEON tower data (replay)", key=f"t_{o['id']}_{date}")
-    else:
+    # Determine the date to load
+    date = st.session_state.target_date
+    if st.session_state.get("live_mode"):
         date = pd.Timestamp.now(tz=TZ).date()
+        
+    if o["source"] == "neon":
+        # Ensure live mode doesn't crash on historical static data if today is outside the range
+        if date < NEON_FIRST or date > NEON_LAST:
+            date = NEON_LAST 
+
+        full = neon_log(volatility)
+        win = noon_window(full, date)
+        view = dict(win=win, profile=noon_window(neon_profile(), date), full=full,
+                    labels=NEON_LABELS, source="Real NEON tower data (replay)" if not st.session_state.get("live_mode") else "Real NEON tower data (Live)", 
+                    key=f"t_{o['id']}_{date}")
+    else:
         win = sim_log(o["scenario"], o["seed"], date, volatility)
         view = dict(win=win, profile=None, full=win, labels=SIM_LABELS,
                     source=f"Simulated sensors: {o['scenario'].lower()}", key=f"t_{o['id']}_{date}")
+    
+    # Set the starting index
     n = len(view["win"])
     if n:
-        st.session_state.pos.setdefault(view["key"], min(DEFAULT_IDX, n - 1))
+        if st.session_state.get("live_mode"):
+            # Snap to current time in live mode
+            now = pd.Timestamp.now(tz=TZ)
+            past_times = [i for i, t in enumerate(win.index) if t <= now]
+            cur_idx = past_times[-1] if past_times else 0
+            st.session_state.pos.setdefault(view["key"], cur_idx)
+            # Update dynamically if live
+            st.session_state.pos[view["key"]] = cur_idx
+        else:
+            st.session_state.pos.setdefault(view["key"], min(DEFAULT_IDX, n - 1))
+            
     return view
+
+
+def send_ntfy_alert(status, orchard_name, timestamp, reasons):
+    """Sends a push notification via ntfy.sh based on the current status."""
+    topic = "agX_evoAG" # Change this to something unique!
+    
+    # Customize the alert appearance based on the status
+    if status == STOP:
+        priority, tags = "urgent", "rotating_light,skull"
+    elif status == CAUTION:
+        priority, tags = "high", "warning"
+    else:
+        priority, tags = "default", "white_check_mark,tractor"
+
+    message = f"Orchard: {orchard_name}\nTime: {timestamp:%A %b %d, %H:%M}\nReasons: {reasons}"
+    
+    requests.post(
+        f"https://ntfy.sh/{topic}",
+        data=message.encode(encoding='utf-8'),
+        headers={
+            "Title": f"Drift Risk: {status}",
+            "Priority": priority,
+            "Tags": tags
+        }
+    )
 
 
 def init_state():
@@ -160,7 +207,8 @@ def init_state():
              scenario="Wind shift above the trees", seed=2),
     ]
     st.session_state.selected_id = "neon-soap"
-    st.session_state.neon_date = DEMO_DATE
+    st.session_state.target_date = DEMO_DATE
+    st.session_state.live_mode = False
     st.session_state.playing = False
     st.session_state.pos = {}  # selected time index per orchard window (survives widget cleanup)
     st.session_state.new_lat, st.session_state.new_lon = 36.75, -119.80
@@ -248,28 +296,44 @@ with left:
                "or click an empty spot to copy its coordinates into Add an orchard.")
 
 with right:
-    if sel["source"] == "neon":
-        st.session_state["_neon_date"] = st.session_state.neon_date
-        st.date_input("Night of", key="_neon_date", min_value=NEON_FIRST, max_value=NEON_LAST,
-                      on_change=sync, args=("_neon_date", "neon_date"),
-                      help="Each window runs from noon to noon the next day.")
+    # Date Picker & Live Mode toggle layout
+    col_date, col_live = st.columns([2, 1])
+    
+    with col_date:
+        st.session_state["_target_date"] = st.session_state.target_date
+        
+        # Enforce limits only if it's NEON (historical static data)
+        min_date = NEON_FIRST if sel["source"] == "neon" else None
+        max_date = NEON_LAST if sel["source"] == "neon" else None
+        
+        st.date_input("Night of", key="_target_date", min_value=min_date, max_value=max_date,
+                      on_change=sync, args=("_target_date", "target_date"),
+                      help="Each window runs from noon to noon the next day.",
+                      disabled=st.session_state.get("live_mode", False))
+                      
+    with col_live:
+        st.markdown("<div style='margin-top: 28px'></div>", unsafe_allow_html=True)
+        st.toggle("🔴 Live updates", key="live_mode", 
+                  help="Auto-refreshes every 60s and snaps to the current time.")
+                  
     win = v["win"]
     if win.empty:
         st.warning("No readings for this date. Pick another night.")
         st.stop()
 
     b1, b2, _ = st.columns([1, 1, 3])
-    if b1.button("Play the night", width="stretch"):
+    if b1.button("Play the night", width="stretch", disabled=st.session_state.get("live_mode", False)):
         st.session_state.playing = True
         st.session_state.pos[v["key"]] = 0
-    if b2.button("Pause", width="stretch"):
+    if b2.button("Pause", width="stretch", disabled=st.session_state.get("live_mode", False)):
         st.session_state.playing = False
 
     labels = [ts.strftime("%a %H:%M") for ts in win.index]
     wkey = "w_" + v["key"]
     st.session_state[wkey] = st.session_state.pos[v["key"]]
     idx = st.select_slider("Time", options=list(range(len(win))), format_func=lambda i: labels[i],
-                           key=wkey, on_change=sync, args=(wkey,), kwargs={"pos_key": v["key"]})
+                           key=wkey, on_change=sync, args=(wkey,), kwargs={"pos_key": v["key"]},
+                           disabled=st.session_state.get("live_mode", False))
     row, ts = win.iloc[idx], win.index[idx]
     status, single = row.status, row.single_station_status
 
@@ -279,6 +343,29 @@ with right:
         f'<div class="sw-action">{ACTION[status]}</div>'
         f'<div class="sw-when">{ts:%A %b %d, %H:%M}<br>{v["source"]}</div></div>',
         unsafe_allow_html=True)
+
+    # --- AUTOMATIC NTFY INTEGRATION START ---
+    # 1. Create a memory register for alerts so we don't spam duplicate pushes
+    if "sent_alerts" not in st.session_state:
+        st.session_state.sent_alerts = set()
+
+    # 2. Check if conditions are bad (STOP or CAUTION)
+    if status in [STOP, CAUTION]:
+        # Create a unique fingerprint for this exact moment and orchard
+        alert_fingerprint = f"{sel['id']}_{ts}_{status}"
+        
+        # 3. Only send if we haven't already sent an alert for this exact fingerprint
+        if alert_fingerprint not in st.session_state.sent_alerts:
+            send_ntfy_alert(
+                status=status, 
+                orchard_name=sel["name"], 
+                timestamp=ts, 
+                reasons=row.reasons
+            )
+            # Mark it as sent so it doesn't fire again on the next Streamlit rerun
+            st.session_state.sent_alerts.add(alert_fingerprint)
+            st.toast(f"Auto-alert sent to team for {status}!", icon="⚠️")
+    # --- AUTOMATIC NTFY INTEGRATION END ---
 
     def mini(label, s):
         return (f'<div class="sw-mini" style="background:{COLORS[s]};color:{TEXT_ON[s]}">'
@@ -419,6 +506,10 @@ with st.sidebar:
             st.rerun()
     st.caption("New orchards use simulated two-height sensors until real sensors are connected.")
 
+# ---------- Auto Refresh Engine ----------
 if st.session_state.playing:
     time.sleep(0.5)
+    st.rerun()
+elif st.session_state.get("live_mode"):
+    time.sleep(60)
     st.rerun()
