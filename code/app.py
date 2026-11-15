@@ -374,7 +374,7 @@ with right:
     st.markdown(
         '<div class="sw-compare">'
         + mini(f"Single ground station ({v['labels']['low_label']} wind only)", single)
-        + mini("Two heights (this tool)", status) + "</div>",
+        + mini("Temperature inversion?", status) + "</div>",
         unsafe_allow_html=True)
     if single == GO and status != GO:
         st.markdown('<div class="sw-note">A single ground station would say GO right now. '
