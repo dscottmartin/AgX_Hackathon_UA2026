@@ -1,4 +1,4 @@
-"""Send explicitly requested drift-risk notifications through ntfy.sh."""
+"""Send drift-risk notifications through ntfy.sh."""
 
 import re
 

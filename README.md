@@ -39,4 +39,4 @@ The command writes combined files in `data/processed/`. The current dashboard's 
 
 ## Push notification demo
 
-Subscribe to a unique topic in the ntfy app, then enter the same topic in the dashboard sidebar. Use **Send push for this reading** to send the selected reading, or turn on **Alert while replaying** to send one alert per STOP or CAUTION status for the selected orchard and night. Notifications identify the data as a demo replay; the dashboard does not receive live sensor readings.
+Subscribe to `agX_evoAG` in the ntfy app. The dashboard uses that topic by default and automatically sends STOP or CAUTION for the selected reading once per orchard, timestamp, and status in the current browser session. You can edit the topic or turn off **Automatically notify on risk** in the sidebar. **Send push for this reading** sends any selected status manually. Notifications identify the data as a demo replay; the dashboard does not receive live sensor readings.

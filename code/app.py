@@ -253,9 +253,10 @@ with st.sidebar:
         "Product volatility", ["low", "medium", "high"], index=1, format_func=str.capitalize,
         help="Volatile products can keep drifting as vapor, so any real inversion becomes a STOP.")
     st.markdown("### Push notifications")
-    ntfy_topic = st.text_input("ntfy.sh topic", help="Subscribe to this topic in the ntfy app.").strip()
-    auto_alerts = st.toggle("Alert while replaying", value=False,
-                            help="Opt in to one alert per STOP or CAUTION status while playing a historical or simulated night.")
+    ntfy_topic = st.text_input("ntfy.sh topic", value="agX_evoAG",
+                               help="Subscribe to this topic in the ntfy app.").strip()
+    auto_alerts = st.toggle("Automatically notify on risk", value=True,
+                            help="Send STOP and CAUTION readings automatically, including historical replays. Turn off to pause notifications.")
     st.caption("Alerts describe the selected replay or simulation, not current field conditions.")
 
 orchards = st.session_state.orchards
@@ -377,10 +378,10 @@ with right:
 
     if "sent_alerts" not in st.session_state:
         st.session_state.sent_alerts = set()
-    alert_key = (ntfy_topic, sel["id"], str(ts.date()), status)
+    alert_key = (ntfy_topic, sel["id"], ts.isoformat(), status)
     manual_alert = st.button("Send push for this reading", disabled=not ntfy_topic,
                              help="Sends the selected historical or simulated reading to your ntfy topic.")
-    should_auto_alert = (auto_alerts and st.session_state.playing and ntfy_topic
+    should_auto_alert = (auto_alerts and ntfy_topic
                          and status in (STOP, CAUTION) and alert_key not in st.session_state.sent_alerts)
     if manual_alert or should_auto_alert:
         try:
